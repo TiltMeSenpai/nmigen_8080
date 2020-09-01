@@ -1,0 +1,8 @@
+setup.py
+nmigen_8080/rom.py
+nmigen_8080/top.py
+nmigen_8080.egg-info/PKG-INFO
+nmigen_8080.egg-info/SOURCES.txt
+nmigen_8080.egg-info/dependency_links.txt
+nmigen_8080.egg-info/requires.txt
+nmigen_8080.egg-info/top_level.txt

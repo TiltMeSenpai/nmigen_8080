@@ -1,0 +1,3 @@
+nmigen@ git+git://github.com/nmigen/nmigen@master
+yowasp-nextpnr-ecp5-25k
+yowasp-yosys
