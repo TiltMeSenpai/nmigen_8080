@@ -36,6 +36,8 @@ class I8080_USB(Elaboratable):
                 self.i_fifo.w_data.eq(self.serial.rx.payload)
             ]
 
+        return m
+
     def txn(self, bus, m):
         running = Signal()
         m.d.sync += [
