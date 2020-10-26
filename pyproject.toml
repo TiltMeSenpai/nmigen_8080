@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "nmigen_8080"
-version = "0.1.0"
+version = "0.2.0"
 description = ""
 authors = ["Josh Koike <jk@tilting.me>"]
 

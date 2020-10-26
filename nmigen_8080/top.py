@@ -4,7 +4,10 @@ from .alu import Alu
 from .ops import OpBlock
 
 class I8080(Elaboratable):
-    def __init__(self):
+    def __init__(self, peripherals={}, imem_size = 0x8000):
+        self.peripherals = peripherals
+        self.imem_size = 0x8000
+
         self.acc = Signal(8)
         self.flags    = Record([
             ("carry", 1),
@@ -43,7 +46,7 @@ class I8080(Elaboratable):
     def elaborate(self, platform):
         m = Module()
         
-        m.submodules.bus = bus = I8080_Bus(self.rom)
+        m.submodules.bus = bus = I8080_Bus(self.rom, self.peripherals, self.imem_size)
         m.submodules.alu = alu = Alu(self.acc, self.flags[0])
 
         cycle = Signal(4)
