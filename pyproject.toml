@@ -6,9 +6,12 @@ authors = ["Josh Koike <jk@tilting.me>"]
 
 [tool.poetry.dependencies]
 python = "^3.7"
-nmigen = { git = "git://github.com/nmigen/nmigen" }
+nmigen = { git = "git://github.com/nmigen/nmigen"}
+usb_protocol = { git = "git://github.com/usb-tools/python-usb-protocol" }
+# luna   = { git = "git://github.com/greatscottgadgets/luna" }
 yowasp-nextpnr-ecp5-25k = "*"
 yowasp-yosys = "*"
+nmigen-yosys = "*"
 
 [tool.poetry.dev-dependencies]
 pylint = "^2.6.0"

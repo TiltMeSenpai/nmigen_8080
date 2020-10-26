@@ -1,3 +1,6 @@
+luna
 nmigen@ git+git://github.com/nmigen/nmigen@master
+nmigen-yosys
+usb_protocol@ git+git://github.com/usb-tools/python-usb-protocol@master
 yowasp-nextpnr-ecp5-25k
 yowasp-yosys

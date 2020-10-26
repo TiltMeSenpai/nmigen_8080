@@ -1,1464 +1,882 @@
-from enum import Enum
-
 from nmigen import *
-from nmigen.sim import *
-
-from .rom import I8080_ROM
-
-class OpBlock(Enum):
-    # Possible decoder op blocks
-    # Drive from core state machine, never read
-    # This results in synth optimizing this out
-    DECODE = 1
-    CARRY_BIT = 2
-    INR = 3
-    DCR = 4
-    CMA = 5
-    DAA = 6
-    HLT = 7
-    MOV_r_M = 8
-    MOV_M_r = 9
-    MOV_r_r = 10
-    STAX = 11
-    LDAX = 12
-    ALU_REG = 13
-    BIT_ROT = 14
-    PUSH = 15
-    POP = 16
-    DAD = 17
-    INX = 18
-    DCX = 19
-    XCHG = 20
-    XTHL = 21
-    SPHL = 22
-    MVI_M_i = 23
-    MVI_r_i = 24
-    ALU_IMM = 25
-    LXI = 26
-    DIRECT = 27
-    PCHL = 28
-    JMP = 29
-    JMP_COND = 30
-    CALL = 31
-    CALL_COND = 32
-    RET = 33
-    RET_COND = 34
-    RST = 35
-    EI_DI = 36
-    IO = 37
-    NOP = 38
+from .bus import I8080_Bus
+from .alu import Alu
+from .ops import OpBlock
 
 class I8080(Elaboratable):
-    # Intel 8080-based Softcore
-    # Bus Notes:
-    # - SYNC denotes a status byte and the start of a memory cycle.
-    # - Contents of DATA during SYNC determine direction and usage of memory
-    # - 1 stall cycle follows SYNC
-    # - If DATA is not ready after this cycle hold HOLD high until DATA is processed
-    # Status Bit Notes:
-    # - Status Bits are nearly identical to the original 8080
-    # - status[0]: INTA (Interrupt Acknowledge)
-    # - status[1]: WON  (Write/Output Negate) 0 = Write or Output
-    # - status[2]: STACK (Memory belongs to stack)
-    # - status[3]: HLTA (Halt Acknowledge)
-    # - status[4]: OUT  (Output)
-    # - status[5]: CODE (Data is being executed as code)
-    # - status[7]: MEMR (Data is memory of some type [Code/RAM/Stack])
     def __init__(self):
-        # External signals
-        self.data_in  = Signal(8)
-        self.data_out = Signal(8)
-        self.addr     = Signal(16)
-        self.inte     = Signal()
-        self.int      = Signal()
-        self.hold     = Signal()
-        self.wait     = Signal()
-        self.sync     = Signal()
-        self.rst      = Signal()
-
-        # ALU signals
-        self._acc   = Signal(8)
-        self._act   = Signal(8)
-        self._flags = Signal(8)
-        self._tmp   = Signal(8)
-
-        # Registers
-        self._w  = Signal(8, reset_less=True)
-        self._z  = Signal(8, reset_less=True)
-        self._wz = Cat(self._z, self._w)
-
-        self._b  = Signal(8, reset_less=True)
-        self._c  = Signal(8, reset_less=True)
-        self._bc = Cat(self._c, self._b)
-
-        self._d  = Signal(8, reset_less=True)
-        self._e  = Signal(8, reset_less=True)
-        self._de = Cat(self._e, self._d)
-
-        self._h  = Signal(8, reset_less=True)
-        self._l  = Signal(8, reset_less=True)
-        self._hl = Cat(self._l, self._h)
-
-        self._sp = Signal(16, reset_less=True)
-        self._pc = Signal(16, reset=0x100)
-
-        self._reg_array = Array([
-            self._b,
-            self._c,
-            self._d,
-            self._e,
-            self._h,
-            self._l,
-            Signal(8),
-            self._acc,
+        self.acc = Signal(8)
+        self.flags    = Record([
+            ("carry", 1),
+            ("0", 1),
+            ("parity", 1),
+            ("1", 1),
+            ("aux_carry", 1),
+            ("2", 1),
+            ("zero", 1),
+            ("sign", 1)
         ])
+
+        self.b = Signal(8)
+        self.c = Signal(8)
+
+        self.d = Signal(8)
+        self.e = Signal(8)
+
+        self.h = Signal(8)
+        self.l = Signal(8)
         
-        self._rp_array = Array([
-            self._bc,
-            self._de,
-            self._hl,
-            self._sp
-        ])
+        self.w = Signal(8)
+        self.x = Signal(8)
 
-        self._state = Signal(range(18), reset=1)
+        self.bc = Cat(self.c, self.b)
+        self.de = Cat(self.e, self.d)
+        self.hl = Cat(self.l, self.h)
+        self.wx = Cat(self.x, self.w)
 
-    def ALU(self, m, op, i, incoming_state):
-        with m.Case(incoming_state):
-            with m.Switch(op):
-                with m.Case(0b000): # ADD
-                    m.d.sync += [
-                        Cat(self._tmp, self._flags[0]).eq(self._acc + i),
-                        self._state.eq(incoming_state + 1)
-                    ]
-                with m.Case(0b001): # ADC
-                    m.d.sync += [
-                        Cat(self._tmp, self._flags[0]).eq(self._acc + i + self._flags[0]),
-                        self._state.eq(incoming_state + 1)
-                    ]
-                with m.Case(0b010): # SUB
-                    m.d.sync += [
-                        Cat(self._tmp, self._flags[0]).eq(self._acc - i),
-                        self._state.eq(incoming_state + 1)
-                    ]
-                with m.Case(0b011): # SBB
-                    m.d.sync += [
-                        Cat(self._tmp, self._flags[0]).eq(self._acc - i - self._flags[0]),
-                        self._state.eq(incoming_state + 1)
-                    ]
-                with m.Case(0b100): # ANA
-                    m.d.sync += [
-                        self._tmp.eq(self._acc & i),
-                        self._state.eq(incoming_state + 1)
-                    ]
-                with m.Case(0b101): # XRA
-                    m.d.sync += [
-                        self._tmp.eq(self._acc ^ i),
-                        self._state.eq(incoming_state + 1)
-                    ]
-                with m.Case(0b110): # ORA
-                    m.d.sync += [
-                        self._tmp.eq(self._acc | i),
-                        self._state.eq(incoming_state + 1)
-                    ]
-                with m.Case(0b111): # CMP
-                    m.d.sync += [
-                        Cat(self._tmp, self._flags[0]).eq(self._acc - i),
-                        self._state.eq(incoming_state + 1)
-                    ]
-        with m.Case(incoming_state + 1):
-            m.d.sync += [
-                self._flags[7].eq(self._tmp[7]),
-                self._flags[6].eq(self._tmp == 0),
-                self._flags[2].eq(~self._tmp.xor()),
-                self._state.eq(1)
-            ]
-            with m.If(op != 0b111):
-                m.d.sync += self._acc.eq(self._tmp)
+        self.pc = Signal(16)
+        self.sp = Signal(16)
+
+        with open("boot.com", "rb") as f:
+            self.rom = f.read()
 
     def elaborate(self, platform):
         m = Module()
+        
+        m.submodules.bus = bus = I8080_Bus(self.rom)
+        m.submodules.alu = alu = Alu(self.acc, self.flags[0])
 
-        m.submodules.rom = I8080_ROM(
-            self.data_out,
-            self.data_in,
-            self.addr,
-            self.hold,
-            self.sync
-        )
+        cycle = Signal(4)
+        instr = Record([
+            ("b", 3),
+            ("a", 3),
+            ("op", 2)
+        ])
+        op = Signal(OpBlock)
+        instr_pc = Signal(16)
+        instr_data = Signal(8)
+        m.d.comb += instr_data.eq(instr)
 
-        instr = Signal(8)
-        instr_op = Signal(OpBlock)
+        reg_array = Array([
+            self.b,
+            self.c,
+            self.d,
+            self.e,
+            self.h,
+            self.l,
+            self.flags,
+            self.acc,
+        ])
+        
+        rp_array = Array([
+            self.bc,
+            self.de,
+            self.hl,
+            self.sp
+        ])
 
         m.d.sync += [
-            self.sync.eq(0)
+            bus.en.eq(0)
         ]
 
-        with m.If(self.rst):
-            m.d.sync += [
-                self._w.eq(0),
-                self._z.eq(0),
-                self._b.eq(0),
-                self._c.eq(0),
-                self._d.eq(0),
-                self._e.eq(0),
-                self._h.eq(0),
-                self._l.eq(0),
-                self._sp.eq(0),
-                self._pc.eq(0),
-                self._state.eq(0),
-                self.data_out.eq(0),
-                self.addr.eq(0)
-            ]
-        with m.Switch(self._state):
-            with m.Case(1):
+        branch = Array([
+            ~self.flags.zero,
+            self.flags.zero,
+            ~self.flags.carry,
+            self.flags.carry,
+            ~self.flags.parity,
+            self.flags.parity,
+            ~self.flags.sign,
+            self.flags.sign
+        ])
+
+        with m.FSM():
+            with m.State("FETCH"):
                 m.d.sync += [
-                    self.addr.eq(self._pc),
-                    self.data_out.eq(Cat(self.int, 0b1100_001)),
-                    self.sync.eq(1),
-                    self._state.eq(2),
-                    instr_op.eq(OpBlock.DECODE),
+                    bus.addr.eq(self.pc),
+                    bus.rw.eq(1),
+                    bus.io.eq(0),
+                    bus.en.eq(1),
+                    instr_pc.eq(self.pc),
+                    self.pc.eq(self.pc + 1),
+                    cycle.eq(0)
                 ]
-                with m.If(self.int):
-                    m.d.sync += self.inte.eq(0) # Disable interrupts if we begin processing one
-            with m.Case(2):
-                m.d.sync += [
-                    self._pc.eq(self._pc + 1),
-                    self._state.eq(3)
-                ]
-            with m.Case(3):
-                m.d.sync += [
-                    instr.eq(self.data_in),
-                    self._state.eq(4)
-                ]
-                with m.If(self.hold):
-                    m.d.sync += [
-                        self._state.eq(3)
-                    ]
-            # Instructions are decoded at ths point, continue
-            with m.Default():
+                m.next = "DECODE"
+            with m.State("DECODE"):
+                with m.If(bus.done):
+                    m.d.sync += instr.eq(bus.data_out) # TODO: Immediate data/addresses could probably be pipelined here
+                    m.next = "EXEC"
+            with m.State("EXEC"):
                 with m.Switch(instr):
-                    with m.Case("0011-111"): # Carry Bit block
-                        m.d.sync += [
-                            self._state.eq(1),
-                            instr_op.eq(OpBlock.CARRY_BIT)
-                        ]
-                        with m.If(instr[3]):
-                            m.d.sync += self._flags[0].eq(~self._flags[0])
+                    with m.Case("00 110 100"): # INR M
+                        m.d.comb += op.eq(OpBlock.INR)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    bus.addr.eq(self.hl),
+                                    bus.rw.eq(1),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        bus.data_in.eq(bus.data_out + 1),
+                                        bus.rw.eq(0),
+                                        bus.en.eq(1),
+                                        cycle.eq(2)
+                                    ]
+                            with m.Case(2):
+                                with m.If(bus.done):
+                                    m.next = "FETCH"
+                    with m.Case("00 --- 100"): # INR r
+                        m.d.comb += op.eq(OpBlock.INR)
+                        m.d.sync += reg_array[instr.a].eq(reg_array[instr.a] + 1)
+                        m.next = "FETCH"
+                    with m.Case("00 110 101"): # DCR M
+                        m.d.comb += op.eq(OpBlock.DCR)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    bus.addr.eq(self.hl),
+                                    bus.rw.eq(1),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        bus.data_in.eq(bus.data_out - 1),
+                                        bus.rw.eq(0),
+                                        bus.en.eq(1),
+                                        cycle.eq(2)
+                                    ]
+                            with m.Case(2):
+                                with m.If(bus.done):
+                                    m.next = "FETCH"
+                    with m.Case("00 --- 101"): # DCR r
+                        m.d.comb += op.eq(OpBlock.DCR)
+                        m.d.sync += reg_array[instr.a].eq(reg_array[instr.a] - 1)
+                        m.next = "FETCH"
+                    with m.Case("00 110 110"):  # MVI M, data
+                        m.d.comb += op.eq(OpBlock.MVI_M_i)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    bus.addr.eq(self.pc),
+                                    bus.rw.eq(1),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    self.pc.eq(self.pc + 1),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        bus.addr.eq(self.hl),
+                                        bus.rw.eq(0),
+                                        bus.data_in.eq(bus.data_out),
+                                        bus.en.eq(1),
+                                        cycle.eq(2)
+                                    ]
+                            with m.Case(2):
+                                with m.If(bus.done):
+                                    m.next = "FETCH"
+                    with m.Case("00 --- 110"): # MVI R, data
+                        m.d.comb += op.eq(OpBlock.MVI_r_i)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    bus.addr.eq(self.pc),
+                                    bus.rw.eq(1),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    self.pc.eq(self.pc + 1),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += reg_array[instr.a].eq(bus.data_out)
+                                    m.next = "FETCH"
+                    with m.Case("00 --0 001"): # LXI
+                        m.d.comb += op.eq(OpBlock.LXI)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    bus.addr.eq(self.pc),
+                                    bus.rw.eq(1),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    self.pc.eq(self.pc + 1),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        bus.addr.eq(self.pc),
+                                        bus.rw.eq(1),
+                                        bus.io.eq(0),
+                                        bus.en.eq(1),
+                                        self.pc.eq(self.pc + 1),
+                                        cycle.eq(2),
+                                        rp_array[instr.a[1:]][:8].eq(
+                                            bus.data_out)
+                                    ]
+                            with m.Case(2):
+                                with m.If(bus.done):
+                                    m.d.sync += rp_array[instr.a[1:]][8:].eq(bus.data_out)
+                                    m.next = "FETCH"
+                    with m.Case("00 --1 001"): # DAD
+                        m.d.comb += op.eq(OpBlock.DAD)
+                        m.d.sync += Cat(self.hl, self.flags.carry).eq(rp_array[instr.a[1:]] + self.hl)
+                        m.next = "FETCH"
+                    with m.Case("00 --0 011"): # INX
+                        m.d.comb += op.eq(OpBlock.INX)
+                        m.d.sync += rp_array[instr.a[1:]].eq(rp_array[instr.a[1:]] + 1)
+                        m.next = "FETCH"
+                    with m.Case("00 --1 011"): # DCX
+                        m.d.comb += op.eq(OpBlock.DCX)
+                        m.d.sync += rp_array[instr.a[1:]].eq(rp_array[instr.a[1:]] - 1)
+                        m.next = "FETCH"
+                    with m.Case("00 0-- 111"): # Accumulator bit rotations
+                        m.d.comb += op.eq(OpBlock.BIT_ROT)
+                        with m.Switch(instr.a):
+                            with m.Case(0b000): # RLC
+                                m.d.sync += [
+                                    self.acc.eq(self.acc.rotate_left(1)),
+                                    self.flags.carry.eq(self.acc[7])
+                                ]
+                                m.next = "FETCH"
+                            with m.Case(0b001): # RRC
+                                m.d.sync += [
+                                    self.acc.eq(self.acc.rotate_right(1)),
+                                    self.flags.carry.eq(self.acc[0])
+                                ]
+                                m.next = "FETCH"
+                            with m.Case(0b010): # RAL
+                                m.d.sync += [
+                                    self.flags.carry.eq(self.acc[7]),
+                                    self.acc.eq(self.acc.rotate_left(1)),
+                                    self.acc[0].eq(self.flags.carry)
+                                ]
+                                m.next = "FETCH"
+                            with m.Case(0b011): # RAR
+                                m.d.sync += [
+                                    self.flags.carry.eq(self.acc[0]),
+                                    self.acc.eq(self.acc.rotate_right(1)),
+                                    self.acc[7].eq(self.flags.carry)
+                                ]
+                                m.next = "FETCH"
+                    with m.Case("00 0-0 010"): # STAX
+                        m.d.comb += op.eq(OpBlock.STAX)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                addr = Mux(instr.a[1], self.de, self.bc)
+                                m.d.sync += [
+                                    bus.rw.eq(0),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    bus.addr.eq(addr),
+                                    cycle.eq(1),
+                                    bus.data_in.eq(self.acc)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.next = "FETCH"
+                    with m.Case("00 0-1 010"): # LDAX
+                        m.d.comb += op.eq(OpBlock.LDAX)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                addr = Mux(instr.a[1], self.de, self.bc)
+                                m.d.sync += [
+                                    bus.rw.eq(1),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    bus.addr.eq(addr),
+                                    cycle.eq(1),
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += self.acc.eq(bus.data_out)
+                                    m.next = "FETCH"
+                    with m.Case("00 11- 010"):  # Direct load/store Accumulator
+                        m.d.comb += op.eq(OpBlock.DIRECT)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    bus.rw.eq(1),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    bus.addr.eq(self.pc),
+                                    self.pc.eq(self.pc + 1),
+                                    cycle.eq(1),
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        bus.addr.eq(self.pc),
+                                        bus.rw.eq(1),
+                                        bus.io.eq(0),
+                                        bus.en.eq(1),
+                                        self.x.eq(bus.data_out),
+                                        self.pc.eq(self.pc + 1),
+                                        cycle.eq(2),
+                                    ]
+                            with m.Case(2):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        bus.addr.eq(Cat(self.x, bus.data_out)),
+                                        bus.io.eq(0),
+                                        bus.en.eq(1),
+                                        cycle.eq(3)
+                                    ]
+                                    with m.If(instr.a[0]): # LDA
+                                        m.d.sync += bus.rw.eq(1)
+                                    with m.Else(): # STA
+                                        m.d.sync += [
+                                            bus.rw.eq(0),
+                                            bus.data_in.eq(self.acc)
+                                        ]
+                            with m.Case(3):
+                                with m.If(bus.done):
+                                    with m.If(instr.a[0]): # LDA
+                                        m.d.sync += self.acc.eq(bus.data_out)
+                                    m.next = "FETCH" # Nothing to do for STA
+                    with m.Case("00 10- 010"):  # Direct load/store HL
+                        m.d.comb += op.eq(OpBlock.DIRECT)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    bus.rw.eq(1),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    bus.addr.eq(self.pc),
+                                    self.pc.eq(self.pc + 1),
+                                    cycle.eq(1),
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        bus.addr.eq(self.pc),
+                                        bus.rw.eq(1),
+                                        bus.io.eq(0),
+                                        bus.en.eq(1),
+                                        self.x.eq(bus.data_out),
+                                        self.pc.eq(self.pc + 1),
+                                        cycle.eq(2),
+                                    ]
+                            with m.Case(2):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        bus.addr.eq(Cat(self.x, bus.data_out)),
+                                        self.w.eq(bus.data_out),
+                                        bus.io.eq(0),
+                                        bus.en.eq(1),
+                                        cycle.eq(3)
+                                    ]
+                                    with m.If(instr.a[0]): # LHLD
+                                        m.d.sync += bus.rw.eq(1)
+                                    with m.Else(): # SHLD
+                                        m.d.sync += [
+                                            bus.rw.eq(0),
+                                            bus.data_in.eq(self.l)
+                                        ]
+                            with m.Case(3):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        bus.addr.eq(self.wx + 1),
+                                        bus.en.eq(1),
+                                        cycle.eq(4)
+                                    ]
+                                    with m.If(instr.a[0]): # LHLD
+                                        m.d.sync += [
+                                            bus.rw.eq(1),
+                                            self.l.eq(bus.data_out)
+                                        ]
+                                    with m.Else(): # SHLD
+                                        m.d.sync += [
+                                            bus.rw.eq(0),
+                                            bus.data_in.eq(self.h)
+                                        ]
+                            with m.Case(4):
+                                with m.If(bus.done):
+                                    with m.If(instr.a[0]):
+                                        m.d.sync += self.h.eq(bus.data_out)
+                                    m.next = "FETCH"
+                    with m.Case("00 101 111"): # CMA
+                        m.d.comb += op.eq(OpBlock.CMA)
+                        m.d.sync += self.acc.eq(~self.acc)
+                        m.next = "FETCH"
+                    with m.Case("00 11- 111"): # CMC/STC
+                        m.d.comb += op.eq(OpBlock.CARRY_BIT)
+                        m.next = "FETCH"
+                        with m.If(instr.a[0]):
+                            m.d.sync += self.flags[0].eq(~self.flags[0])
                         with m.Else():
-                            m.d.sync += self._flags[0].eq(1)
-                    with m.Case("00---100"): # INR
-                        d = instr[3:6]
-                        m.d.sync += instr_op.eq(OpBlock.INR)
-                        with m.If(d == 0b110):
-                            with m.Switch(self._state):
-                                with m.Case(4):
+                            m.d.sync += self.flags[0].eq(1)
+                    with m.Case("01 110 110"):
+                        m.d.comb += op.eq(OpBlock.HLT)
+                        m.next = "HALT"
+                    with m.Case("01 110 ---"): # MOV r, M
+                        m.d.comb += op.eq(OpBlock.MOV_r_M)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    bus.addr.eq(self.hl),
+                                    bus.io.eq(0),
+                                    bus.rw.eq(0),
+                                    bus.en.eq(1),
+                                    bus.data_in.eq(reg_array[instr.b]),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.next = "FETCH"
+                    with m.Case("01 --- 110"): # MOV M, r
+                        m.d.comb += op.eq(OpBlock.MOV_M_r)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    bus.addr.eq(self.hl),
+                                    bus.io.eq(0),
+                                    bus.rw.eq(1),
+                                    bus.en.eq(1),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += reg_array[instr.a].eq(bus.data_out)
+                                    m.next = "FETCH"
+                    with m.Case("01 --- ---"): # MOV r, r
+                        m.d.comb += op.eq(OpBlock.MOV_r_r)
+                        m.d.sync += reg_array[instr.a].eq(reg_array[instr.b])
+                        m.next = "FETCH"
+                    with m.Case("10 --- 110"): # ALU block (Mem)
+                        m.d.comb += op.eq(OpBlock.ALU_REG)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    bus.addr.eq(self.hl),
+                                    bus.io.eq(0),
+                                    bus.rw.eq(1),
+                                    bus.en.eq(1),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
                                     m.d.sync += [
-                                        self.addr.eq(self._rp_array[2]),
-                                        self.sync.eq(1),
-                                        self.data_out.eq(0b1000_0010),
-                                        self._state.eq(5)
+                                        alu.alu_in.eq(bus.data_out),
+                                        alu.op.eq(instr.a),
+                                        cycle.eq(2)
                                     ]
-                                with m.Case(5):
-                                    m.d.sync += [
-                                        self._state.eq(6)
-                                    ]
-                                with m.Case(6):
-                                    m.d.sync += [
-                                        self._tmp.eq(self.data_in),
-                                        self._state.eq(7)
-                                    ]
-                                    with m.If(self.hold):
-                                        m.d.sync += self._state.eq(6)
-                                with m.Case(7):
-                                    m.d.sync += [
-                                        self._tmp.eq(self._tmp + 1),
-                                        self._flags[7].eq(self._tmp[7]),
-                                        self._flags[6].eq(self._tmp == 0),
-                                        self._flags[2].eq(~self._tmp.xor()),
-                                        self.addr.eq(self._rp_array[2]),
-                                        self.sync.eq(1),
-                                        self.data_out.eq(0b1000_0000),
-                                        self._state.eq(8),
-                                    ]
-                                with m.Case(8):
-                                    m.d.sync += self._state.eq(9)
-                                with m.Case(9):
-                                    m.d.sync += [
-                                        self.data_out.eq(self._tmp),
-                                        self._state.eq(1)
-                                    ]
-                                    with m.If(self.hold):
-                                        m.d.sync += self._state.eq(9)
-                        with m.Else():
-                            m.d.sync += [
-                                self._reg_array[d].eq(self._reg_array[d] + 1),
-                                self._flags[7].eq(self._reg_array[d][7]),
-                                self._flags[6].eq(self._reg_array[d] == 0),
-                                self._flags[2].eq(~self._reg_array[d].xor()),
-                                self._state.eq(1)
-                            ]
-                    with m.Case("00---101"): # DCR
-                        d = instr[3:6]
-                        m.d.sync += instr_op.eq(OpBlock.DCR)
-                        with m.If(d == 0b110):
-                            with m.Switch(self._state):
-                                with m.Case(4):
-                                    m.d.sync += [
-                                        self.addr.eq(self._rp_array[2]),
-                                        self.sync.eq(1),
-                                        self.data_out.eq(0b1000_0010),
-                                        self._state.eq(5)
-                                    ]
-                                with m.Case(5):
-                                    m.d.sync += [
-                                        self._state.eq(6)
-                                    ]
-                                with m.Case(6):
-                                    m.d.sync += [
-                                        self._tmp.eq(self.data_in),
-                                        self._state.eq(7)
-                                    ]
-                                    with m.If(self.hold):
-                                        m.d.sync += self._state.eq(6)
-                                with m.Case(7):
-                                    m.d.sync += [
-                                        self._tmp.eq(self._tmp - 1),
-                                        self._flags[7].eq(self._tmp[7]),
-                                        self._flags[6].eq(self._tmp == 0),
-                                        self._flags[2].eq(~self._tmp.xor()),
-                                        self.addr.eq(self._rp_array[2]),
-                                        self.sync.eq(1),
-                                        self.data_out.eq(0b1000_0000),
-                                        self._state.eq(8),
-                                    ]
-                                with m.Case(8):
-                                    m.d.sync += self._state.eq(9)
-                                with m.Case(9):
-                                    m.d.sync += [
-                                        self.data_out.eq(self._tmp),
-                                        self._state.eq(1)
-                                    ]
-                                    with m.If(self.hold):
-                                        m.d.sync += self._state.eq(9)
-                        with m.Else():
-                            m.d.sync += [
-                                self._reg_array[d].eq(self._reg_array[d] - 1),
-                                self._flags[7].eq(self._reg_array[d][7]),
-                                self._flags[6].eq(self._reg_array[d] == 0),
-                                self._flags[2].eq(~self._reg_array[d].xor()),
-                                self._state.eq(1)
-                            ]
-                    with m.Case("00101111"): # CMA
-                        m.d.sync += [
-                            self._acc.eq(~self._acc),
-                            self._state.eq(1),
-                            instr_op.eq(OpBlock.CMA)
-                        ]
-                    with m.Case("01110110"): # HLT
-                        m.d.sync += [
-                            self.data_out.eq(0b0000_1000),
-                            self.wait.eq(1),
-                            instr_op.eq(OpBlock.HLT)
-                        ]
-                    with m.Case("01---110"): # MOV r, M
-                        d = instr[3:6]
-                        m.d.sync += instr_op.eq(OpBlock.MOV_r_M)
-                        with m.Switch(self._state):
-                            with m.Case(4):
-                                m.d.sync += [
-                                    self.addr.eq(self._rp_array[2]),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0010),
-                                    self._state.eq(5)
-                                ]
-                            with m.Case(5):
-                                m.d.sync += [
-                                    self._state.eq(6)
-                                ]
-                            with m.Case(6):
-                                m.d.sync += [
-                                    self._reg_array[d].eq(self.data_in),
-                                    self._state.eq(1)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(6)
-                    with m.Case("01110---"): # MOV m, r 
-                        s = instr[:3]
-                        m.d.sync += instr_op.eq(OpBlock.MOV_M_r)
-                        with m.Switch(self._state):
-                            with m.Case(4):
-                                m.d.sync += [
-                                    self.addr.eq(self._rp_array[2]),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0000),
-                                    self._state.eq(5)
-                                ]
-                            with m.Case(5):
-                                m.d.sync += [
-                                    self._state.eq(6)
-                                ]
-                            with m.Case(6):
-                                m.d.sync += [
-                                    self.data_out.eq(self._reg_array[s]),
-                                    self._state.eq(1)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(6)
-                    with m.Case("01------"): # MOV r, r 
-                        s = instr[:3]
-                        d = instr[3:6]
-                        m.d.sync += instr_op.eq(OpBlock.MOV_r_r)
-                        m.d.sync += [
-                            self._reg_array[d].eq(self._reg_array[s]),
-                            self._state.eq(1)
-                        ]
-                    with m.Case("000-0010"): # STAX
-                        m.d.sync += instr_op.eq(OpBlock.STAX)
-                        with m.Switch(self._state):
-                            with m.Case(4):
-                                m.d.sync += [
-                                    self.addr.eq(self._rp_array[instr[4]]),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0000),
-                                    self._state.eq(5),
-                                ]
-                            with m.Case(5):
-                                m.d.sync += self._state.eq(6)
-                            with m.Case(6):
-                                m.d.sync += [
-                                    self.data_out.eq(self._acc),
-                                    self._state.eq(1)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(6)
-                    with m.Case("000-1010"): # LDAX
-                        m.d.sync += instr_op.eq(OpBlock.LDAX)
-                        with m.Switch(self._state):
-                            with m.Case(4):
-                                m.d.sync += [
-                                    self.addr.eq(self._rp_array[instr[4]]),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0010),
-                                    self._state.eq(5),
-                                ]
-                            with m.Case(5):
-                                m.d.sync += self._state.eq(6)
-                            with m.Case(6):
-                                m.d.sync += [
-                                    self._acc.eq(self.data_in),
-                                    self._state.eq(1)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(6)
-                    with m.Case("10------"): # ALU op block
-                        op = instr[3:6]
-                        s  = instr[:3]
-                        m.d.sync += instr_op.eq(OpBlock.ALU_REG)
-                        with m.If(s == 0b110):
-                            with m.Switch(self._state):
-                                with m.Case(4):
-                                    m.d.sync += [
-                                        self.addr.eq(self._rp_array[2]),
-                                        self.sync.eq(1),
-                                        self.data_out.eq(0b1000_0010),
-                                        self._state.eq(5),
-                                    ]
-                                with m.Case(5):
-                                    m.d.sync += self._state.eq(6)
-                                with m.Case(6):
-                                    m.d.sync += [
-                                        self._act.eq(self.data_in),
-                                        self._state.eq(7)
-                                    ]
-                                    with m.If(self.hold):
-                                        m.d.sync += self._state.eq(6)
-                                self.ALU(m, op, self.data_in, 7)
-                        with m.Else():
-                            with m.Switch(self._state):
-                                self.ALU(m, op, self._reg_array[s], 4)
-                    with m.Case("000--111"): # Accumulator Bit Rotations
-                        op = instr[3:5]
-                        m.d.sync += instr_op.eq(OpBlock.BIT_ROT)
-                        with m.Switch(op):
-                            with m.Case(0b00):
-                                m.d.sync += [
-                                    self._acc.eq(self._acc.rotate_left(1)),
-                                    self._flags[0].eq(self._acc[7]),
-                                    self._state.eq(1)
-                                ]
-                            with m.Case(0b01):
-                                m.d.sync += [
-                                    self._acc.eq(self._acc.rotate_right(1)),
-                                    self._flags[0].eq(self._acc[0]),
-                                    self._state.eq(1),
-                                ]
-                            with m.Case(0b10):
-                                m.d.sync += [
-                                    Cat(self._acc, self._flags[0]).eq(Cat(self._acc, self._flags[0]).rotate_left(1)),
-                                    self._state.eq(1)
-                                ]
-                            with m.Case(0b11):
-                                m.d.sync += [
-                                    Cat(self._flags[0], self._acc).eq(Cat(self._flags[0], self._acc).rotate_right(1)),
-                                    self._state.eq(1)
-                                ]
-                    with m.Case("11--0101"): # PUSH
-                        rp = instr[4:6]
-                        m.d.sync += instr_op.eq(OpBlock.PUSH)
-                        with m.Switch(self._state):
-                            with m.Case(4):
-                                m.d.sync += [
-                                    self._sp.eq(self._sp - 1),
-                                    self._state.eq(5)
-                                ]
-                            with m.Case(5):
-                                m.d.sync += [
-                                    self.addr.eq(self._sp),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0100),
-                                    self._state.eq(6)
-                                ]
-                            with m.Case(6):
-                                m.d.sync += [
-                                    self._state.eq(7),
-                                    self._sp.eq(self._sp - 1)
-                                ]
-                            with m.Case(7):
-                                m.d.sync += self._state.eq(8)
-                                with m.Switch(rp):
-                                    with m.Case(0b00):
-                                        m.d.sync += self.data_out.eq(self._b)
-                                    with m.Case(0b01):
-                                        m.d.sync += self.data_out.eq(self._d)
-                                    with m.Case(0b10):
-                                        m.d.sync += self.data_out.eq(self._h)
-                                    with m.Case(0b11):
-                                        m.d.sync += self.data_out.eq(self._flags)
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(7)
-                            with m.Case(8):
-                                m.d.sync += [
-                                    self.addr.eq(self._sp),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0100),
-                                    self._state.eq(9)
-                                ]
-                            with m.Case(9):
-                                m.d.sync += [
-                                    self._state.eq(10),
-                                ]
-                            with m.Case(10):
-                                m.d.sync += self._state.eq(1)
-                                with m.Switch(rp):
-                                    with m.Case(0b00):
-                                        m.d.sync += self.data_out.eq(self._c)
-                                    with m.Case(0b01):
-                                        m.d.sync += self.data_out.eq(self._e)
-                                    with m.Case(0b10):
-                                        m.d.sync += self.data_out.eq(self._l)
-                                    with m.Case(0b11):
-                                        m.d.sync += self.data_out.eq(self._acc)
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(10)
-                    with m.Case("11--0001"): # POP
-                        rp = instr[4:6]
-                        m.d.sync += instr_op.eq(OpBlock.POP)
-                        with m.Switch(self._state):
-                            with m.Case(4):
-                                m.d.sync += [
-                                    self.addr.eq(self._sp),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0110),
-                                    self._state.eq(5)
-                                ]
-                            with m.Case(5):
-                                m.d.sync += [
-                                    self._state.eq(6),
-                                    self._sp.eq(self._sp + 1)
-                                ]
-                            with m.Case(6):
-                                m.d.sync += self._state.eq(7)
-                                with m.Switch(rp):
-                                    with m.Case(0b00):
-                                        m.d.sync += self._c.eq(self.data_in)
-                                    with m.Case(0b01):
-                                        m.d.sync += self._e.eq(self.data_in)
-                                    with m.Case(0b10):
-                                        m.d.sync += self._l.eq(self.data_in)
-                                    with m.Case(0b11):
-                                        m.d.sync += self._acc.eq(self.data_in)
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(6)
-                            with m.Case(7):
-                                m.d.sync += [
-                                    self.addr.eq(self._sp),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0110),
-                                    self._state.eq(8)
-                                ]
-                            with m.Case(8):
-                                m.d.sync += [
-                                    self._sp.eq(self._sp + 1),
-                                    self._state.eq(9),
-                                ]
-                            with m.Case(9):
-                                m.d.sync += self._state.eq(1)
-                                with m.Switch(rp):
-                                    with m.Case(0b00):
-                                        m.d.sync += self._b.eq(self.data_in)
-                                    with m.Case(0b01):
-                                        m.d.sync += self._d.eq(self.data_in)
-                                    with m.Case(0b10):
-                                        m.d.sync += self._h.eq(self.data_in)
-                                    with m.Case(0b11):
-                                        m.d.sync += self._flags.eq(self.data_in)
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(9)
-                    with m.Case("00--1001"): # DAD
-                        rp = instr[4:6]
-                        m.d.sync += [
-                            Cat(self._hl, self._flags[0]).eq(self._hl + self._rp_array[rp]),
-                            self._state.eq(1),
-                            instr_op.eq(OpBlock.DAD)
-                        ]
-                    with m.Case("00--0011"): # INX
-                        rp = instr[4:6]
-                        m.d.sync += [
-                            self._rp_array[rp].eq(self._rp_array[rp] + 1),
-                            self._state.eq(1),
-                            instr_op.eq(OpBlock.INX)
-                        ]
-                    with m.Case("00--1011"): # DCX
-                        rp = instr[4:6]
-                        m.d.sync += [
-                            self._rp_array[rp].eq(self._rp_array[rp] - 1),
-                            self._state.eq(1),
-                            instr_op.eq(OpBlock.DCX)
-                        ]
-                    with m.Case("11101011"): # XCHG
-                        m.d.sync += [
-                            Cat(self._rp_array[1], self._rp_array[2]).eq(Cat(self._rp_array[2], self._rp_array[1])),
-                            self._state.eq(1),
-                            instr_op.eq(OpBlock.XCHG)
-                        ]
-                    with m.Case("11100011"): # XTHL
-                        m.d.sync += instr_op.eq(OpBlock.XTHL)
-                        with m.Switch(self._state):
-                            with m.Case(4):
-                                m.d.sync += [
-                                    self.addr.eq(self._sp),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0010),
-                                    self._state.eq(5)
-                                ]
-                            with m.Case(5):
-                                m.d.sync += [
-                                    self._sp.eq(self._sp + 1),
-                                    self._state.eq(6)
-                                ]
-                            with m.Case(6):
-                                m.d.sync += [
-                                    self._z.eq(self.data_in),
-                                    self._state.eq(7)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(6)
-                            with m.Case(7):
-                                m.d.sync += [
-                                    self.addr.eq(self._sp),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0010),
-                                    self._state.eq(8)
-                                ]
-                            with m.Case(8):
-                                m.d.sync += [
-                                    self._state.eq(9)
-                                ]
-                            with m.Case(9):
-                                m.d.sync += [
-                                    self._w.eq(self.data_in),
-                                    self._state.eq(10)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(9)
-                            with m.Case(10):
-                                m.d.sync += [
-                                    self.addr.eq(self._sp),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0000),
-                                    self._state.eq(11)
-                                ]
-                            with m.Case(11):
-                                m.d.sync += [
-                                    self._sp.eq(self._sp - 1),
-                                    self._state.eq(12)
-                                ]
-                            with m.Case(12):
-                                m.d.sync += [
-                                    self.data_out.eq(self._h),
-                                    self._state.eq(13)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(12)
-                            with m.Case(13):
-                                m.d.sync += [
-                                    self.addr.eq(self._sp),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0000),
-                                    self._state.eq(14)
-                                ]
-                            with m.Case(14):
-                                m.d.sync += [
-                                    self._state.eq(15)
-                                ]
-                            with m.Case(15):
-                                m.d.sync += [
-                                    self.data_out.eq(self._l),
-                                    self._rp_array[2].eq(self._wz),
-                                    self._state.eq(1)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(15)
-                    with m.Case("11111001"): # SPHL
-                        m.d.sync += [
-                            self._sp.eq(self._rp_array[2]),
-                            self._state.eq(1),
-                            instr_op.eq(OpBlock.SPHL)
-                        ]
-
-                    with m.Case("00110110"): # MVI M, data
-                        m.d.sync += instr_op.eq(OpBlock.MVI_M_i)
-                        with m.Switch(self._state):
-                            with m.Case(4):
-                                m.d.sync += [
-                                    self.addr.eq(self._pc),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1100_0010),
-                                    self._state.eq(5)
-                                ]
-                            with m.Case(5):
-                                m.d.sync += [
-                                    self._pc.eq(self._pc + 1),
-                                    self._state.eq(6)
-                                ]
-                            with m.Case(6):
-                                m.d.sync += [
-                                    self._tmp.eq(self.data_in),
-                                    self._state.eq(7)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(6)
-                            with m.Case(7):
-                                m.d.sync += [
-                                    self.addr.eq(self._rp_array[2]),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0000),
-                                    self._state.eq(8)
-                                ]
-                            with m.Case(8):
-                                m.d.sync += [
-                                    self._state.eq(9)
-                                ]
-                            with m.Case(9):
-                                m.d.sync += [
-                                    self.data_out.eq(self._tmp),
-                                    self._state.eq(1)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(9)
-                    with m.Case("00---110"): # MVI r, data
-                        d = instr[3:6]
-                        m.d.sync += instr_op.eq(OpBlock.MVI_r_i)
-                        with m.Switch(self._state):
-                            with m.Case(4):
-                                m.d.sync += [
-                                    self.addr.eq(self._pc),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1100_0010),
-                                    self._state.eq(5)
-                                ]
-                            with m.Case(5):
-                                m.d.sync += [
-                                    self._pc.eq(self._pc + 1),
-                                    self._state.eq(6)
-                                ]
-                            with m.Case(6):
-                                m.d.sync += [
-                                    self._reg_array[d].eq(self.data_in),
-                                    self._state.eq(1)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(6)
-                    with m.Case("11---110"): # Immediate ALU group
-                        op = instr[3:6]
-                        m.d.sync += instr_op.eq(OpBlock.ALU_IMM)
-                        with m.Switch(self._state):
-                            with m.Case(4):
-                                m.d.sync += [
-                                    self.addr.eq(self._pc),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1100_0010),
-                                    self._state.eq(5)
-                                ]
-                            with m.Case(5):
-                                m.d.sync += [
-                                    self._pc.eq(self._pc + 1),
-                                    self._state.eq(6)
-                                ]
-                            with m.Case(6):
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(6)
+                            with m.Case(2):
+                                m.next = "FETCH"
+                                with m.If(instr.a == 0b111):
+                                    m.d.sync += self.flags.eq(alu.flags)
                                 with m.Else():
                                     m.d.sync += [
-                                        self._tmp.eq(self.data_in),
-                                        self._state.eq(7)
+                                        self.acc.eq(alu.alu_out),
+                                        self.flags.eq(alu.flags)
                                     ]
-                            self.ALU(m, op, self.data_in, 7)
-                    with m.Case("00--0001"): # LXI
-                        rp = instr[4:6]
-                        m.d.sync += instr_op.eq(OpBlock.LXI)
-                        with m.Switch(self._state):
+                    with m.Case("10 --- ---"): # ALU block
+                        m.d.comb += op.eq(OpBlock.ALU_REG)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    alu.alu_in.eq(reg_array[instr.b]),
+                                    alu.op.eq(instr.a),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                m.next = "FETCH"
+                                m.d.sync += self.flags.eq(alu.flags)
+                                with m.If(instr.a != 0b111):
+                                    m.d.sync += self.acc.eq(alu.alu_out)
+                    with m.Case("11 011 011"): # IN
+                        m.d.comb += op.eq(OpBlock.IO)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    self.pc.eq(self.pc + 1),
+                                    bus.addr.eq(self.pc),
+                                    bus.rw.eq(1),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        bus.addr.eq(Cat(bus.data_out, bus.data_out)),
+                                        bus.rw.eq(1),
+                                        bus.io.eq(1),
+                                        bus.en.eq(1),
+                                        cycle.eq(2)
+                                    ]
+                            with m.Case(2):
+                                with m.If(bus.done):
+                                    m.d.sync += self.acc.eq(bus.data_out)
+                                    m.next = "FETCH"
+                    with m.Case("11 010 011"): # OUT
+                        m.d.comb += op.eq(OpBlock.IO)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    self.pc.eq(self.pc + 1),
+                                    bus.addr.eq(self.pc),
+                                    bus.rw.eq(1),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        bus.addr.eq(Cat(bus.data_out, bus.data_out)),
+                                        bus.rw.eq(0),
+                                        bus.io.eq(1),
+                                        bus.en.eq(1),
+                                        bus.data_in.eq(self.acc),
+                                        cycle.eq(2)
+                                    ]
+                            with m.Case(2):
+                                with m.If(bus.done):
+                                    m.next = "FETCH"
+                    with m.Case("11 100 011"): # XTHL
+                        m.d.comb += op.eq(OpBlock.XTHL)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    bus.addr.eq(self.sp),
+                                    bus.rw.eq(1),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        self.x.eq(bus.data_out),
+                                        bus.addr.eq(self.sp + 1),
+                                        bus.en.eq(1),
+                                        cycle.eq(2)
+                                    ]
+                            with m.Case(2):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        self.w.eq(bus.data_out),
+                                        bus.addr.eq(self.sp),
+                                        bus.rw.eq(0),
+                                        bus.data_in.eq(self.l),
+                                        bus.en.eq(1),
+                                        cycle.eq(3)
+                                    ]
+                            with m.Case(3):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        bus.addr.eq(self.sp + 1),
+                                        bus.data_in.eq(self.h),
+                                        bus.en.eq(1),
+                                        cycle.eq(4)
+                                    ]
                             with m.Case(4):
-                                m.d.sync += [
-                                    self.addr.eq(self._pc),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1100_0010),
-                                    self._state.eq(5)
-                                ]
-                            with m.Case(5):
-                                m.d.sync += [
-                                    self._pc.eq(self._pc + 1),
-                                    self._state.eq(6)
-                                ]
-                            with m.Case(6):
-                                m.d.sync += [
-                                    self._z.eq(self.data_in),
-                                    self._state.eq(7)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(6)
-                            with m.Case(7):
-                                m.d.sync += [
-                                    self.addr.eq(self._pc),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1100_0010),
-                                    self._state.eq(8)
-                                ]
-                            with m.Case(8):
-                                m.d.sync += [
-                                    self._pc.eq(self._pc + 1),
-                                    self._state.eq(9)
-                                ]
-                            with m.Case(9):
-                                m.d.sync += [
-                                    self._w.eq(self.data_in),
-                                    self._state.eq(10)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(9)
-                            with m.Case(10):
-                                m.d.sync += [
-                                    self._rp_array[rp].eq(self._wz),
-                                    self._state.eq(1)
-                                ]
-                    with m.Case("001--010"): # Direct Addressing block
-                        op = instr[3:5]
-                        m.d.sync += instr_op.eq(OpBlock.DIRECT)
-                        with m.Switch(self._state):
-                            with m.Case(4):
-                                m.d.sync += [
-                                    self.addr.eq(self._pc),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1100_0010),
-                                    self._state.eq(5),
-                                ]
-                            with m.Case(5):
-                                m.d.sync += [
-                                    self._pc.eq(self._pc + 1),
-                                    self._state.eq(6)
-                                ]
-                            with m.Case(6):
-                                m.d.sync += [
-                                    self._z.eq(self.data_in),
-                                    self._state.eq(7)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(6)
-                            with m.Case(7):
-                                m.d.sync += [
-                                    self.addr.eq(self._pc),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1100_0010),
-                                    self._state.eq(8),
-                                ]
-                            with m.Case(8):
-                                m.d.sync += [
-                                    self._pc.eq(self._pc + 1),
-                                    self._state.eq(9)
-                                ]
-                            with m.Case(9):
-                                m.d.sync += [
-                                    self._w.eq(self.data_in),
-                                    self._state.eq(10)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(9)
-                            with m.Case(10):
-                                m.d.sync += [
-                                    self.addr.eq(self._wz),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(Cat(0, op[0], 0b1000_00)),
-                                    self._state.eq(11)
-                                ]
-                            with m.Case(11):
-                                m.d.sync += [
-                                    self._state.eq(12),
-                                    self._wz.eq(self._wz + 1)
-                                ]
-                            with m.Case(12):
-                                m.d.sync += self._state.eq(1)
-                                with m.Switch(op):
-                                    with m.Case(0b00):
-                                        m.d.sync += [
-                                            self.data_out.eq(self._l),
-                                            self._state.eq(13),
-                                        ]
-                                    with m.Case(0b01):
-                                        m.d.sync += [
-                                            self._l.eq(self.data_in),
-                                            self._state.eq(13)
-                                        ]
-                                    with m.Case(0b10):
-                                        m.d.sync += self.data_out.eq(self._acc)
-                                    with m.Case(0b11):
-                                        m.d.sync += self._acc.eq(self.data_in)
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(12)
-                            with m.Case(13):
-                                m.d.sync += [
-                                    self.addr.eq(self._wz),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(Cat(0, op[0], 0b1000_00)),
-                                    self._state.eq(14)
-                                ]
-                            with m.Case(14):
-                                m.d.sync += self._state.eq(15)
-                            with m.Case(15):
-                                m.d.sync += self._state.eq(1)
-                                with m.Switch(op):
-                                    with m.Case(0b00):
-                                        m.d.sync += self.data_out.eq(self._h)
-                                    with m.Case(0b01):
-                                        m.d.sync += self._h.eq(self.data_in)
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(15)
-
-
-                    with m.Case("11101001"): # PCHL
+                                with m.If(bus.done):
+                                    m.d.sync += self.hl.eq(self.wx)
+                                    m.next = "FETCH"
+                    with m.Case("11 101 001"): # PCHL
+                        m.d.comb += op.eq(OpBlock.PCHL)
+                        m.d.sync += self.pc.eq(self.hl)
+                        m.next = "FETCH"
+                    with m.Case("11 101 011"): # XCHG
+                        m.d.comb += op.eq(OpBlock.XCHG)
                         m.d.sync += [
-                            self._pc.eq(self._rp_array[2]),
-                            self._state.eq(1),
-                            instr_op.eq(OpBlock.PCHL)
+                            self.de.eq(self.hl),
+                            self.hl.eq(self.de)
                         ]
-                    with m.Case("11000011"): # JMP
-                        m.d.sync += instr_op.eq(OpBlock.JMP)
-                        with m.Switch(self._state):
+                        m.next = "FETCH"
+                    with m.Case("11 11- 011"): # EI/DI
+                        m.d.comb += op.eq(OpBlock.EI_DI)
+                        m.next = "FETCH" # TODO: Implement interrupts
+                    with m.Case("11 111 001"): # SPHL
+                        m.d.comb += op.eq(OpBlock.SPHL)
+                        m.d.sync += self.sp.eq(self.hl)
+                        m.next = "FETCH"
+                    with m.Case("11 --- 110"): # Immediate ALU group
+                        m.d.comb += op.eq(OpBlock.ALU_IMM)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    self.pc.eq(self.pc + 1),
+                                    bus.addr.eq(self.pc),
+                                    bus.rw.eq(1),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        alu.alu_in.eq(bus.data_out),
+                                        alu.op.eq(instr.a),
+                                        cycle.eq(2)
+                                    ]
+                            with m.Case(2):
+                                m.d.sync += self.flags.eq(alu.flags)
+                                m.next = "FETCH"
+                                with m.If(instr.a != 0b111):
+                                    m.d.sync += self.acc.eq(alu.alu_out)
+                    with m.Case("11 --- 111"): # RST
+                        m.d.comb += op.eq(OpBlock.RST)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    self.sp.eq(self.sp - 2),
+                                    bus.data_in.eq(self.pc[8:]),
+                                    bus.addr.eq(self.sp - 1),
+                                    bus.rw.eq(0),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        bus.data_in.eq(self.pc[:8]),
+                                        bus.addr.eq(self.sp),
+                                        bus.en.eq(1),
+                                        cycle.eq(2)
+                                    ]
+                            with m.Case(2):
+                                with m.If(bus.done):
+                                    m.d.sync += self.pc.eq(instr.a << 3)
+                                    m.next = "FETCH"
+                    with m.Case("11 110 101"): # PUSH PSW
+                        m.d.comb += op.eq(OpBlock.PUSH)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    self.sp.eq(self.sp - 2),
+                                    bus.data_in.eq(self.acc),
+                                    bus.addr.eq(self.sp - 1),
+                                    bus.rw.eq(0),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        bus.data_in.eq(self.flags),
+                                        bus.addr.eq(self.sp),
+                                        bus.en.eq(1),
+                                        cycle.eq(2)
+                                    ]
+                            with m.Case(2):
+                                with m.If(bus.done):
+                                    m.next = "FETCH"
+                    with m.Case("11 --0 101"): # PUSH
+                        m.d.comb += op.eq(OpBlock.PUSH)
+                        rp = rp_array[instr.a[1:]]
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    self.sp.eq(self.sp - 2),
+                                    bus.data_in.eq(rp[8:]),
+                                    bus.addr.eq(self.sp - 1),
+                                    bus.rw.eq(0),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        bus.data_in.eq(rp[:8]),
+                                        bus.addr.eq(self.sp),
+                                        bus.en.eq(1),
+                                        cycle.eq(2)
+                                    ]
+                            with m.Case(2):
+                                with m.If(bus.done):
+                                    m.next = "FETCH"
+                    with m.Case("11 110 001"): # POP PSW
+                        m.d.comb += op.eq(OpBlock.POP)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    self.sp.eq(self.sp + 1),
+                                    bus.addr.eq(self.sp),
+                                    bus.rw.eq(1),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        self.flags.eq(bus.data_out),
+                                        self.sp.eq(self.sp + 1),
+                                        bus.addr.eq(self.sp),
+                                        bus.rw.eq(1),
+                                        bus.io.eq(0),
+                                        bus.en.eq(1),
+                                        cycle.eq(2)
+                                    ]
+                            with m.Case(2):
+                                with m.If(bus.done):
+                                    m.d.sync += self.acc.eq(bus.data_out)
+                                    m.next = "FETCH"
+                    with m.Case("11 --0 001"): # POP
+                        m.d.comb += op.eq(OpBlock.POP)
+                        rp = rp_array[instr.a[1:]]
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    self.sp.eq(self.sp + 1),
+                                    bus.addr.eq(self.sp),
+                                    bus.rw.eq(1),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        rp[:8].eq(bus.data_out),
+                                        self.sp.eq(self.sp + 1),
+                                        bus.addr.eq(self.sp),
+                                        bus.rw.eq(1),
+                                        bus.io.eq(0),
+                                        bus.en.eq(1),
+                                        cycle.eq(2)
+                                    ]
+                            with m.Case(2):
+                                with m.If(bus.done):
+                                    m.d.sync += rp[8:].eq(bus.data_out)
+                                    m.next = "FETCH"
+                    with m.Case("11 --- 00-"): # Return
+                        m.d.comb += op.eq(OpBlock.RET)
+                        with m.If(instr.b[0] | branch[instr.a]):
+                            with m.Switch(cycle):
+                                with m.Case(0):
+                                    m.d.sync += [
+                                        self.sp.eq(self.sp + 1),
+                                        bus.addr.eq(self.sp),
+                                        bus.rw.eq(1),
+                                        bus.io.eq(0),
+                                        bus.en.eq(1),
+                                        cycle.eq(1)
+                                    ]
+                                with m.Case(1):
+                                    with m.If(bus.done):
+                                        m.d.sync += [
+                                            self.pc[:8].eq(bus.data_out),
+                                            self.sp.eq(self.sp + 1),
+                                            bus.addr.eq(self.sp),
+                                            bus.rw.eq(1),
+                                            bus.io.eq(0),
+                                            bus.en.eq(1),
+                                            cycle.eq(2)
+                                        ]
+                                with m.Case(2):
+                                    with m.If(bus.done):
+                                        m.d.sync += self.pc[8:].eq(bus.data_out)
+                                        m.next = "FETCH"
+                        with m.Else():
+                            m.next = "FETCH"
+                    with m.Case("11 --- 01-"): # Jump
+                        m.d.comb += op.eq(OpBlock.JMP)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    self.pc.eq(self.pc + 1),
+                                    bus.addr.eq(self.pc),
+                                    bus.rw.eq(1),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        self.pc.eq(self.pc + 1),
+                                        self.x.eq(bus.data_out),
+                                        bus.addr.eq(self.pc),
+                                        bus.rw.eq(1),
+                                        bus.io.eq(0),
+                                        bus.en.eq(1),
+                                        cycle.eq(2)
+                                    ]
+                            with m.Case(2):
+                                with m.If(bus.done):
+                                    with m.If(instr.b[0] | branch[instr.a]):
+                                        m.d.sync += self.pc.eq(Cat(self.x, bus.data_out))
+                                    m.next = "FETCH"
+                    with m.Case("11 --- 10-"): # Call
+                        m.d.comb += op.eq(OpBlock.CALL)
+                        with m.Switch(cycle):
+                            with m.Case(0):
+                                m.d.sync += [
+                                    self.pc.eq(self.pc + 1),
+                                    bus.addr.eq(self.pc),
+                                    bus.rw.eq(1),
+                                    bus.io.eq(0),
+                                    bus.en.eq(1),
+                                    cycle.eq(1)
+                                ]
+                            with m.Case(1):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        self.pc.eq(self.pc + 1),
+                                        self.x.eq(bus.data_out),
+                                        bus.addr.eq(self.pc),
+                                        bus.rw.eq(1),
+                                        bus.io.eq(0),
+                                        bus.en.eq(1),
+                                        cycle.eq(2)
+                                    ]
+                            with m.Case(2):
+                                with m.If(bus.done):
+                                    with m.If(instr.b[0] | branch[instr.a]):
+                                        m.d.sync += [
+                                            self.sp.eq(self.sp - 2),
+                                            bus.addr.eq(self.sp - 1),
+                                            self.w.eq(bus.data_out),
+                                            bus.data_in.eq(self.pc[8:]),
+                                            bus.rw.eq(0),
+                                            bus.en.eq(1),
+                                            cycle.eq(3)
+                                        ]
+                                    with m.Else():
+                                        m.next = "FETCH"
+                            with m.Case(3):
+                                with m.If(bus.done):
+                                    m.d.sync += [
+                                        self.pc.eq(self.wx),
+                                        bus.addr.eq(self.sp),
+                                        bus.data_in.eq(self.pc[:8]),
+                                        bus.en.eq(1),
+                                        cycle.eq(4)
+                                    ]
                             with m.Case(4):
-                                m.d.sync += [
-                                    self.addr.eq(self._pc),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1100_0010),
-                                    self._state.eq(5)
-                                ]
-                            with m.Case(5):
-                                m.d.sync += [
-                                    self._pc.eq(self._pc + 1),
-                                    self._state.eq(6)
-                                ]
-                            with m.Case(6):
-                                m.d.sync += [
-                                    self._z.eq(self.data_in),
-                                    self._state.eq(7)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(6)
-                            with m.Case(7):
-                                m.d.sync += [
-                                    self.addr.eq(self._pc),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1100_0010),
-                                    self._state.eq(8)
-                                ]
-                            with m.Case(8):
-                                m.d.sync += [
-                                    self._pc.eq(self._pc + 1),
-                                    self._state.eq(9)
-                                ]
-                            with m.Case(9):
-                                m.d.sync += [
-                                    self._w.eq(self.data_in),
-                                    self._state.eq(10)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(9)
-                            with m.Case(10):
-                                m.d.sync += [
-                                    self._pc.eq(self._wz),
-                                    self._state.eq(1)
-                                ]
-                    with m.Case("11---010"): # Jump Condtitional block
-                        cond = instr[3:6]
-                        m.d.sync += instr_op.eq(OpBlock.JMP_COND)
-                        with m.Switch(self._state):
-                            with m.Case(4):
-                                m.d.sync += [
-                                    self.addr.eq(self._pc),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1100_0010),
-                                    self._state.eq(5)
-                                ]
-                            with m.Case(5):
-                                m.d.sync += [
-                                    self._pc.eq(self._pc + 1),
-                                    self._state.eq(6)
-                                ]
-                            with m.Case(6):
-                                m.d.sync += [
-                                    self._z.eq(self.data_in),
-                                    self._state.eq(7)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(6)
-                            with m.Case(7):
-                                m.d.sync += [
-                                    self.addr.eq(self._pc),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1100_0010),
-                                    self._state.eq(8)
-                                ]
-                            with m.Case(8):
-                                m.d.sync += [
-                                    self._pc.eq(self._pc + 1),
-                                    self._state.eq(9)
-                                ]
-                            with m.Case(9):
-                                m.d.sync += [
-                                    self._w.eq(self.data_in),
-                                    self._state.eq(10)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(9)
-                            with m.Case(10):
-                                m.d.sync += self._state.eq(1)
-                                with m.Switch(cond[1:]):
-                                    with m.Case(0b00):
-                                        with m.If(self._flags[6] == cond[0]):
-                                            m.d.sync += self._pc.eq(self._wz)
-                                    with m.Case(0b01):
-                                        with m.If(self._flags[0] == cond[0]):
-                                            m.d.sync += self._pc.eq(self._wz)
-                                    with m.Case(0b10):
-                                        with m.If(self._flags[2] == cond[0]):
-                                            m.d.sync += self._pc.eq(self._wz)
-                                    with m.Case(0b11):
-                                        with m.If(self._flags[7] == cond[0]):
-                                            m.d.sync += self._pc.eq(self._wz)
-                    with m.Case("11001101"): # CALL
-                        m.d.sync += instr_op.eq(OpBlock.CALL)
-                        with m.Switch(self._state):
-                            with m.Case(4):
-                                m.d.sync += [
-                                    self.addr.eq(self._pc),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1100_0010),
-                                    self._state.eq(5)
-                                ]
-                            with m.Case(5):
-                                m.d.sync += [
-                                    self._pc.eq(self._pc + 1),
-                                    self._state.eq(6)
-                                ]
-                            with m.Case(6):
-                                m.d.sync += [
-                                    self._z.eq(self.data_in),
-                                    self._state.eq(7)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(6)
-                            with m.Case(7):
-                                m.d.sync += [
-                                    self.addr.eq(self._pc),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1100_0010),
-                                    self._state.eq(8)
-                                ]
-                            with m.Case(8):
-                                m.d.sync += [
-                                    self._pc.eq(self._pc + 1),
-                                    self._state.eq(9)
-                                ]
-                            with m.Case(9):
-                                m.d.sync += [
-                                    self._w.eq(self.data_in),
-                                    self._state.eq(10)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(9)
-                            with m.Case(10):
-                                m.d.sync += [
-                                    self.addr.eq(self._sp),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0100),
-                                    self._state.eq(11)
-                                ]
-                            with m.Case(11):
-                                m.d.sync += [
-                                    self._sp.eq(self._sp - 1),
-                                    self._state.eq(12)
-                                ]
-                            with m.Case(12):
-                                m.d.sync += [
-                                    self.data_out.eq(self._pc[8:]),
-                                    self._state.eq(13)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(12)
-                            with m.Case(13):
-                                m.d.sync += [
-                                    self.addr.eq(self._sp),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0100),
-                                    self._state.eq(14)
-                                ]
-                            with m.Case(14):
-                                m.d.sync += [
-                                    self._sp.eq(self._sp - 1),
-                                    self._state.eq(15)
-                                ]
-                            with m.Case(15):
-                                m.d.sync += [
-                                    self.data_out.eq(self._pc[:8]),
-                                    self._pc.eq(self._wz),
-                                    self._state.eq(1)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(15)
-                    with m.Case("11---100"): # Call conditional block
-                        cond = instr[3:6]
-                        m.d.sync += instr_op.eq(OpBlock.CALL_COND)
-                        with m.Switch(self._state):
-                            with m.Case(4):
-                                m.d.sync += [
-                                    self.addr.eq(self._pc),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1100_0010),
-                                    self._state.eq(5)
-                                ]
-                            with m.Case(5):
-                                m.d.sync += [
-                                    self._pc.eq(self._pc + 1),
-                                    self._state.eq(6)
-                                ]
-                            with m.Case(6):
-                                m.d.sync += [
-                                    self._z.eq(self.data_in),
-                                    self._state.eq(7)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(6)
-                            with m.Case(7):
-                                m.d.sync += [
-                                    self.addr.eq(self._pc),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1100_0010),
-                                    self._state.eq(8)
-                                ]
-                            with m.Case(8):
-                                m.d.sync += [
-                                    self._pc.eq(self._pc + 1),
-                                    self._state.eq(9)
-                                ]
-                            with m.Case(9):
-                                m.d.sync += [
-                                    self._w.eq(self.data_in),
-                                    self._state.eq(1)
-                                ]
-                                with m.Switch(cond[1:]):
-                                    m.d.sync += self._state.eq(1)
-                                    with m.Case(0b00):
-                                        with m.If(self._flags[6] == cond[0]):
-                                            m.d.sync += self._state.eq(10)
-                                    with m.Case(0b01):
-                                        with m.If(self._flags[0] == cond[0]):
-                                            m.d.sync += self._state.eq(10)
-                                    with m.Case(0b10):
-                                        with m.If(self._flags[2] == cond[0]):
-                                            m.d.sync += self._state.eq(10)
-                                    with m.Case(0b11):
-                                        with m.If(self._flags[7] == cond[0]):
-                                            m.d.sync += self._state.eq(10)
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(9)
-                            with m.Case(10):
-                                m.d.sync += [
-                                    self.addr.eq(self._sp),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0100),
-                                    self._state.eq(11)
-                                ]
-                            with m.Case(11):
-                                m.d.sync += [
-                                    self._sp.eq(self._sp - 1),
-                                    self._state.eq(12)
-                                ]
-                            with m.Case(12):
-                                m.d.sync += [
-                                    self.data_out.eq(self._pc[8:]),
-                                    self._state.eq(13)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(12)
-                            with m.Case(13):
-                                m.d.sync += [
-                                    self.addr.eq(self._sp),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0100),
-                                    self._state.eq(14)
-                                ]
-                            with m.Case(14):
-                                m.d.sync += [
-                                    self._sp.eq(self._sp - 1),
-                                    self._state.eq(15)
-                                ]
-                            with m.Case(15):
-                                m.d.sync += [
-                                    self.data_out.eq(self._pc[:8]),
-                                    self._pc.eq(self._wz),
-                                    self._state.eq(1)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(15)
-                    with m.Case("11001001"): # RET
-                        m.d.sync += instr_op.eq(OpBlock.RET)
-                        with m.Switch(self._state):
-                            with m.Case(4):
-                                m.d.sync += [
-                                    self._sp.eq(self._sp + 1),
-                                    self.addr.eq(self._sp + 1),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0110),
-                                    self._state.eq(5)
-                                ]
-                            with m.Case(5):
-                                m.d.sync += [
-                                    self._state.eq(6)
-                                ]
-                            with m.Case(6):
-                                m.d.sync += [
-                                    self._z.eq(self.data_in),
-                                    self._state.eq(7)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(6)
-                            with m.Case(7):
-                                m.d.sync += [
-                                    self._sp.eq(self._sp + 1),
-                                    self.addr.eq(self._sp + 1),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0110),
-                                    self._state.eq(8)
-                                ]
-                            with m.Case(8):
-                                m.d.sync += [
-                                    self._state.eq(9)
-                                ]
-                            with m.Case(9):
-                                m.d.sync += [
-                                    self._w.eq(self.data_in),
-                                    self._state.eq(10)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(9)
-                            with m.Case(10):
-                                m.d.sync += [
-                                    self._pc.eq(self._wz),
-                                    self._state.eq(1)
-                                ]
-                    with m.Case("11---00-"): # Return Block
-                        cond = instr[3:6]
-                        m.d.sync += instr_op.eq(OpBlock.RET_COND)
-                        with m.Switch(self._state):
-                            with m.Case(4):
-                                with m.Switch(cond[1:]):
-                                    m.d.sync += self._state.eq(1)
-                                    with m.Case(0b00):
-                                        with m.If(self._flags[6] == cond[0]):
-                                            m.d.sync += [
-                                                self._sp.eq(self._sp + 1),
-                                                self._state.eq(5)
-                                            ]
-                                    with m.Case(0b01):
-                                        with m.If(self._flags[0] == cond[0]):
-                                            m.d.sync += [
-                                                self._sp.eq(self._sp + 1),
-                                                self._state.eq(5)
-                                            ]
-                                    with m.Case(0b10):
-                                        with m.If(self._flags[2] == cond[0]):
-                                            m.d.sync += [
-                                                self._sp.eq(self._sp + 1),
-                                                self._state.eq(5)
-                                            ]
-                                    with m.Case(0b11):
-                                        with m.If(self._flags[7] == cond[0]):
-                                            m.d.sync += [
-                                                self._sp.eq(self._sp + 1),
-                                                self._state.eq(5)
-                                            ]
-                            with m.Case(5):
-                                m.d.sync += [
-                                    self.addr.eq(self._sp),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0110),
-                                    self._state.eq(6)
-                                ]
-                            with m.Case(6):
-                                m.d.sync += [
-                                    self._state.eq(7)
-                                ]
-                            with m.Case(7):
-                                m.d.sync += [
-                                    self._z.eq(self.data_in),
-                                    self._state.eq(8)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(7)
-                            with m.Case(8):
-                                m.d.sync += [
-                                    self._sp.eq(self._sp + 1),
-                                    self.addr.eq(self._sp + 1),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0110),
-                                    self._state.eq(9)
-                                ]
-                            with m.Case(9):
-                                m.d.sync += [
-                                    self._state.eq(10)
-                                ]
-                            with m.Case(10):
-                                m.d.sync += [
-                                    self._w.eq(self.data_in),
-                                    self._state.eq(11)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(10)
-                            with m.Case(11):
-                                m.d.sync += [
-                                    self._pc.eq(self._wz),
-                                    self._state.eq(1)
-                                ]
-                    with m.Case("11---111"): # RST
-                        exp = instr[3:6]
-                        m.d.sync += instr_op.eq(OpBlock.RST)
-                        with m.Switch(self._state):
-                            with m.Case(4):
-                                m.d.sync += [
-                                    self.addr.eq(self._sp),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0000),
-                                    self._state.eq(5)
-                                ]
-                            with m.Case(5):
-                                m.d.sync += [
-                                    self._sp.eq(self._sp - 1),
-                                    self._state.eq(6)
-                                ]
-                            with m.Case(6):
-                                m.d.sync += [
-                                    self.data_out.eq(self._pc[4:]),
-                                    self._state.eq(7)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(6)
-                            with m.Case(7):
-                                m.d.sync += [
-                                    self.addr.eq(self._sp),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1000_0000),
-                                    self._state.eq(8)
-                                ]
-                            with m.Case(8):
-                                m.d.sync += [
-                                    self._sp.eq(self._sp - 1),
-                                    self._state.eq(9)
-                                ]
-                            with m.Case(9):
-                                m.d.sync += [
-                                    self.data_out.eq(self._pc[:4]),
-                                    self._pc.eq(exp << 3),
-                                    self._state.eq(1)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(9)
-                    with m.Case("1111-011"): # EI/DI
-                        m.d.sync += [
-                            self.inte.eq(instr[3]),
-                            self._state.eq(1),
-                            instr_op.eq(OpBlock.EI_DI)
-                        ]
-                    with m.Case("1101-011"): # IN/OUT
-                        io = instr[3]
-                        m.d.sync += instr_op.eq(OpBlock.IO)
-                        with m.Switch(self._state):
-                            with m.Case(4):
-                                m.d.sync += [
-                                    self.addr.eq(self._pc),
-                                    self.sync.eq(1),
-                                    self.data_out.eq(0b1010_0010),
-                                    self._state.eq(5),
-                                ]
-                            with m.Case(5):
-                                m.d.sync += [
-                                    self._pc.eq(self._pc + 1),
-                                    self._state.eq(6)
-                                ]
-                            with m.Case(6):
-                                m.d.sync += [
-                                    self._w.eq(self.data_in),
-                                    self._state.eq(7)
-                                ]
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(6)
-                            with m.Case(7):
-                                m.d.sync += [
-                                    self.addr.eq(Cat(self._w, self._w)),
-                                    self.data_out.eq(Cat(*[0, io, 0, ~io, 0, 0, io, 0][::-1])),
-                                    self.sync.eq(1),
-                                    self._state.eq(8)
-                                ]
-                            with m.Case(8):
-                                m.d.sync += self._state.eq(9)
-                            with m.Case(9):
-                                m.d.sync += self._state.eq(1)
-                                with m.If(io):
-                                    m.d.sync += self._acc.eq(self.data_in)
-                                with m.Else():
-                                    m.d.sync += self.data_out.eq(self._acc)
-                                with m.If(self.hold):
-                                    m.d.sync += self._state.eq(9)
+                                with m.If(bus.done):
+                                    m.next = "FETCH"
                     with m.Default(): # NOP
-                        m.d.sync += [
-                            self._state.eq(1),
-                            instr_op.eq(OpBlock.NOP)
-                        ]
+                        m.d.comb += op.eq(OpBlock.NOP)
+                        m.next = "FETCH"
+            with m.State("HALT"):
+                pass
+
 
         return m
-        
 
 if __name__ == "__main__":
-    import sys
-    sys.setrecursionlimit(4096)
+    import sys, os
+    from nmigen.sim import Simulator
+    sys.setrecursionlimit(8192)
     sim = Simulator(I8080())
-    sim.add_clock(5e-5)
+    sim.add_clock(1e-4)
     with sim.write_vcd("trace.vcd"):
         sim.run_until(1, run_passive=True)
