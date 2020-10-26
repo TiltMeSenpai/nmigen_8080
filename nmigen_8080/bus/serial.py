@@ -12,8 +12,8 @@ class I8080_USB(Elaboratable):
                                       product_string="intel 8080 serial port"
                                       )
         
-        self.i_fifo = AsyncFIFO(8, 8, r_domain="usb", w_domain="sync")
-        self.o_fifo = AsyncFIFO(8, 8, r_domain="sync", w_domain="usb")
+        self.i_fifo = AsyncFIFO(width=8, depth=8, r_domain="usb", w_domain="sync")
+        self.o_fifo = AsyncFIFO(width=8, depth=8, r_domain="sync", w_domain="usb")
 
     def elaborate(self, platform):
         m = Module()
